@@ -16,5 +16,5 @@ Implement the node-wise lasso and graphical lasso approaches in R:
 This group project is submitted as part of assessed coursework.
 
 ## Files
-- `main.Rmd` contains all R code and elementary analysis.
+- `graphical_lasso.Rmd` contains all R code and elementary analysis.
 - `report.pdf` is the written report summarising the findings.
