@@ -1,0 +1,1043 @@
+---
+title: "Graphical Lasso"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(MASS)
+library(glmnet) # Node-wise Lasso
+library(glasso) # Graphical Lasso
+library(igraph) # Visualisation
+library(CVglasso)
+
+#install.packages("doMC", repos="http://R-Forge.R-project.org")
+library(doMC)  # Multiprocessing
+
+library(remotes)
+#remotes::install_github("gabrielrvsc/HDeconometrics")
+library(HDeconometrics) #ic.glmnet
+```
+
+# Setup
+```{r cache=TRUE}
+# Matrix standardiser
+# Convert covariance matrix to correlation matrix
+## Theta = covariance matrix
+theta_matrix_standardizer <- function(theta){
+  D = diag(sqrt(diag(theta)))
+  Dinv = diag(1/diag(D))
+  correlation_matrix = Dinv %*% theta %*% Dinv
+  return(correlation_matrix)
+}
+
+# Generate the matrix
+## p = number of variables
+## n = number of observations
+## prob = probability of each entry of inverse covariance matrix begin non-zero
+## Theta = inverse covariance matrix
+## Sigma = covariance matrix
+## E_true = true edge set, derived from the matrix
+generate <- function(p, n, prob=0.1){
+  delta <- 3 # initial delta
+  # Generate Theta (before standardisation)
+  while (TRUE) {
+    Theta <- matrix(0,p,p)
+    num_edge <- p*(p-1)/2 
+    Theta[upper.tri(Theta)] <- 0.5*rbinom(num_edge, 1, prob)
+    Theta <- Theta + t(Theta) # symmetric
+    Theta <- Theta + delta*diag(p)
+    if (min(eigen(Theta)$values) >= 1) break
+    delta <- delta + 1
+  }
+  Theta <- theta_matrix_standardizer(Theta)
+  obj <- list()
+  obj$Theta <- Theta
+  obj$Sigma <- solve(Theta)
+  obj$E_true <- Theta[upper.tri(Theta)]!=0 # derive set E
+  obj$X <- mvrnorm(n=n, mu=rep(0, p), Sigma=obj$Sigma) # simulate mvnormal data
+  return(obj)
+}
+
+################################################################################
+
+# Plot the ROC curve
+plot.roc <- function(TPR, FPR, ...){
+  # Sort the FPR, TPR pairs into ascending order and add the endpoints
+  FPR_asc_idx <- order(FPR)
+  FPR_asc <- c(0, sort(FPR), 1)
+  TPR_asc <- c(0, TPR[FPR_asc_idx], 1)
+  plot(FPR_asc, TPR_asc, "l", xlab="FPR", ylab="TPR", xlim=c(0,1), ylim=c(0,1), ...)
+  clip(0,1,0,1)
+  abline(a=0, b=1, col="grey", lty=2) #45-degree line
+}
+
+plot.roc.overlay <- function(TPRn1, FPRn1, TPRn2, FPRn2, TPRg, FPRg, ...){
+  # Sort the FPR, TPR pairs into ascending order and add the endpoints
+  FPRn1_asc_idx <- order(FPRn1)
+  FPRn1_asc <- c(0, sort(FPRn1), 1)
+  TPRn1_asc <- c(0, TPRn1[FPRn1_asc_idx], 1)
+  FPRn2_asc_idx <- order(FPRn2)
+  FPRn2_asc <- c(0, sort(FPRn2), 1)
+  TPRn2_asc <- c(0, TPRn1[FPRn2_asc_idx], 1)
+  FPRg_asc_idx <- order(FPRg)
+  FPRg_asc <- c(0, sort(FPRg), 1)
+  TPRg_asc <- c(0, TPRg[FPRg_asc_idx], 1)
+  plot(FPRn1_asc, TPRn1_asc, type="l", col="red", xlab="FPR", ylab="TPR", xlim=c(0,1), ylim=c(0,1), ...)
+  lines(FPRn2_asc, TPRn2_asc, type="l", col="blue")
+  lines(FPRg_asc, TPRg_asc, type="l", col="green")
+  legend("bottomright", legend=c("Nodewise 1","Nodewise 2", "Glasso"), col=c("red","blue","green"), lty=1)
+  clip(0,1,0,1)
+  abline(a=0, b=1, col="grey", lty=2)
+}
+
+# Calculate (approximate) area under the ROC curve using trapeziums
+## TPR vector of TPRs
+## FPR vector of FPRs
+auc <- function(TPR, FPR){
+  # Sort the FPR, TPR pairs into ascending order and add the endpoints
+  FPR_asc_idx <- order(FPR)
+  FPR_asc <- c(0, sort(FPR), 1)
+  TPR_asc <- c(0, TPR[FPR_asc_idx], 1)
+  # Calculate termwise difference
+  dFPR <- c(diff(FPR_asc), 0)
+  dTPR <- c(diff(TPR_asc), 0)
+  # Approximate area by trapeziums (rectangle + triangle)
+  return(sum(TPR_asc*dFPR)+(sum(dTPR*dFPR))/2) 
+}
+
+###############################################################################
+# Plot the error with standard errors
+plot.error <- function(Error, grid, ...){
+  mean <- apply(Error, 2, mean)
+  sd <- apply(Error, 2, sd)
+  se <- sd/nrow(Error)
+  id_min <- which.min(mean)
+  id_1se <- which(mean<(mean+se)[id_min])[1] # 1 standard error
+  # plot
+  plot(log(grid), mean, "l", ...)
+  abline(h=mean[id_min]+se[id_min],xlim=xlim, ylim=ylim, lty=2, col=2)
+  abline(v=log(grid)[id_min],xlim=xlim, ylim=ylim, lty=2, col=2)
+  abline(v=log(grid)[id_1se],xlim=xlim, ylim=ylim, lty=2, col=2)
+  lines(log(grid), (mean+se), xlim=xlim, ylim=ylim, col="grey", lty=1)
+  lines(log(grid), (mean-se), xlim=xlim, ylim=ylim, col="grey", lty=1)
+  return(list(lambda.min=grid[id_min], lambda.1se=grid[id_1se]))
+}
+
+###############################################################################
+
+## X=mutilvariate normal data
+## lambda parameter in lasso
+## Beta=matrix of estimated beta
+## E_1 estimation of E using approach 1 (vector form)
+## E_2 estimation of E using approach 2 (vector form)
+predict.nodewise <- function(X, lambda){
+  p <- ncol(X)
+  Beta <- matrix(NA, nrow=p, ncol=p)
+  for (j in 1:p){
+    lasso <- glmnet(X[,-j], X[,j], lambda = lambda)
+    beta_j <- coef(lasso, exact=TRUE)[2:p] # extract coefficients
+    beta_j <- append(beta_j, 0, after=(j-1)) #append 0 to the j-th position
+    Beta[, j] <- beta_j #append to the j-th column
+  }
+  obj <- list()
+  obj$Beta <- Beta
+  obj$E_1 <- Beta[upper.tri(Beta)]!=0 & t(Beta)[upper.tri(Beta)]!=0 #derive edge set for node1
+  obj$E_2 <- Beta[upper.tri(Beta)]!=0 | t(Beta)[upper.tri(Beta)]!=0 #derive edge set for node2
+  return(obj)
+}
+
+# See the performance of a prediction
+# choose these objects that are false and cal them
+performance.nodewise <- function(predict, actual){
+  TN <- sum(predict==0 & actual==0)
+  TP <- sum(predict==1 & actual==1)
+  FN <- sum(predict==0 & actual==1)
+  FP <- sum(predict==1 & actual==0)
+  obj <- list()
+  obj$tpr <- TP/(TP+FN)
+  obj$fpr <- FP/(FP+TN)
+  obj$error <- (FP+FN)/(TN+TP+FN+FP)
+  return(obj)
+}
+
+# using TPR and FPR using two methods
+# Draw ROC curve and get AUC
+performance.nodewise.grid <- function(X, E_true, grid){
+  tpr_1 <- fpr_1 <- error_1 <- tpr_2 <- fpr_2 <- error_2 <- c()
+  p <- ncol(X)
+  for (i in 1:length(grid)){
+    pred.nodewise <- predict.nodewise(X, grid[i])
+    perf_1 <- performance.nodewise(pred.nodewise$E_1, E_true)
+    perf_2 <- performance.nodewise(pred.nodewise$E_2, E_true)
+    # append measures
+    tpr_1[i] <- perf_1$tpr
+    fpr_1[i] <- perf_1$fpr
+    error_1[i] <- perf_1$error
+    tpr_2[i] <- perf_2$tpr
+    fpr_2[i] <- perf_2$fpr
+    error_2[i] <- perf_2$error
+  }
+  obj <- list(tpr_1=tpr_1, fpr_1=fpr_1, error_1=error_1,
+              tpr_2=tpr_2, fpr_2=fpr_2, error_2=error_2)
+  obj$auc_1 <- auc(tpr_1, fpr_1)
+  obj$auc_2 <- auc(tpr_2, fpr_2)
+  return(obj)
+}
+
+## Find optimal lambda and compare statistics
+## grid = grid of lambda values to be searched
+optimal.nodewise <- function(X, E_true, grid, k=10){
+  #n <- nrow(X)
+  registerDoMC(cores=8)
+  errors <- aics <- bics <- rep(0, length(grid))
+  total.error <- total.aic <- total.bic <- c()
+    for (j in 1:p){
+    # k-fold cross-validation
+    cv.fit <- cv.glmnet(X[,-j],X[,j], lambda=grid, nfolds=k, parallel=TRUE)
+    errors <- errors + cv.fit$cvm #sum up errors for lambda grid
+    
+    # AIC
+    aic.fit <- ic.glmnet(X[,-j],X[,j], crit="aic", lambda=grid)
+    aics <- aics + aic.fit$ic.range #sum up aics for lambda grid
+    
+    # BIC
+    bic.fit <- ic.glmnet(X[,-j],X[,j], crit="bic", lambda=grid)
+    bics <- bics + bic.fit$ic.range #sum up bics for lambda grid
+  }
+  
+  # k-fold CV
+  errors <- errors/p
+  while (TRUE){
+    min.error <- min(errors)
+    grid.cv <- grid
+    lambda.min.cv <- grid.cv[which.min(errors)]
+    best.cv <- predict.nodewise(X, lambda=lambda.min.cv)
+    # If the predicted edge set is empty, try again with next best value of lambda
+    if (sum(best.cv$E_1)!=0 & sum(best.cv$E_2)!=0) break
+    errors <- errors[-which.min(errors)]
+    grid.cv <- grid.cv[-which.min(errors)]
+  }
+  best.cv.perf.n1 <- performance.nodewise(best.cv$E_1, E_true)
+  best.cv.perf.n2 <- performance.nodewise(best.cv$E_2, E_true)
+  
+  # AIC
+  aics <- aics/p
+  while (TRUE){
+    min.aic <- min(aics)
+    grid.aic <- grid
+    lambda.min.aic <- grid.aic[which.min(aics)]
+    best.aic <- predict.nodewise(X, lambda=lambda.min.aic)
+    # If the predicted edge set is empty, try again with next best value of lambda
+    if (sum(best.aic$E_1)!=0 & sum(best.cv$E_2)!=0) break
+    aics <- aics[-which.min(aics)]
+    grid.aic <- grid.aic[-which.min(aics)]
+  }
+  best.aic.perf.n1 <- performance.nodewise(best.aic$E_1, E_true)
+  best.aic.perf.n2 <- performance.nodewise(best.aic$E_2, E_true)
+  
+  # BIC
+  bics <- bics/p
+  while (TRUE){
+    min.bic <- min(bics)
+    grid.bic <- grid
+    lambda.min.bic <- grid.bic[which.min(bics)]
+    best.bic <- predict.nodewise(X, lambda=lambda.min.bic)
+    # If the predicted edge set is empty, try again with next best value of lambda
+    if (sum(best.bic$E_1)!=0 & sum(best.bic$E_2)!=0) break
+    bics <- bics[-which.min(bics)]
+    grid.bic <- grid.bic[-which.min(bics)]
+  }
+  best.bic.perf.n1 <- performance.nodewise(best.bic$E_1, E_true)
+  best.bic.perf.n2 <- performance.nodewise(best.bic$E_2, E_true)
+  
+  obj <- list()
+  obj$lambda <- list(cv=lambda.min.cv, aic=lambda.min.aic, bic=lambda.min.bic)
+  obj$score <- list(cv=min.error, aic=min.aic, bic=min.bic)
+  obj$n1tpr <- list(cv=best.cv.perf.n1$tpr, aic=best.aic.perf.n1$tpr, bic=best.bic.perf.n1$tpr)
+  obj$n1fpr <- list(cv=best.cv.perf.n1$fpr, aic=best.aic.perf.n1$fpr, bic=best.bic.perf.n1$fpr)
+  obj$n1error <- list(cv=best.cv.perf.n1$error, aic=best.aic.perf.n1$error, bic=best.bic.perf.n1$error)
+  obj$n2tpr <- list(cv=best.cv.perf.n2$tpr, aic=best.aic.perf.n2$tpr, bic=best.bic.perf.n2$tpr)
+  obj$n2fpr <- list(cv=best.cv.perf.n2$fpr, aic=best.aic.perf.n2$fpr, bic=best.bic.perf.n2$fpr)
+  obj$n2error <- list(cv=best.cv.perf.n2$error, aic=best.aic.perf.n2$error, bic=best.bic.perf.n2$error)
+  return(obj)
+}
+
+################################################################################
+
+# Glasso solver
+## X = observations
+## lambda = tuning parameter
+predict.glasso <- function(X, lambda){
+  S <- var(X)
+  g <- glasso(S, rho=lambda, nobs=dim(X)[1])
+  adj <- abs(g$wi) > 0
+  diag(adj) <- 0
+  obj <- list()
+  obj$Theta <- adj
+  obj$E <- adj[upper.tri(adj)]!=0
+  return(obj)
+}
+
+# Graphing the Edge Set
+## S is the correlation matrix
+## Can be visualised using plot(...)
+grapher <- function(S){
+  adj <- abs(S) > 0
+  diag(adj) <- 0
+  plot <- graph.adjacency(adj, mode="undirected")
+  return(plot)
+}
+
+# See the performance of a predictor
+## Predict is the predicted Theta matrix
+## Actual is the true Theta matrix
+## Converts into igraph objects for calculations
+performance.glasso <- function(predict, actual){
+  predict.graph <- grapher(predict)
+  actual.graph <- grapher(actual)
+  p <- gorder(actual.graph)
+  num_edges <- p*(p-1)/2
+  PP <- gsize(predict.graph)
+  PN <- num_edges - PP
+  FN <- gsize(difference(actual.graph, predict.graph))
+  FP <- gsize(difference(predict.graph, actual.graph))
+  TP <- PP - FP
+  TN <- PN - FN
+  obj <- list()
+  obj$tpr = TP/(TP+FN)
+  obj$fpr = FP/(FP+TN)
+  obj$error = (FN+FP)/num_edges
+  return(obj)
+}
+
+# Grid search for glasso
+# Draw ROC curve and get AUC
+performance.glasso.grid <- function(X, true, grid){
+  tpr <- fpr <- error <- c()
+  for (i in 1:length(grid)){
+    pred.glasso <- predict.glasso(X, grid[i])
+    perf <- performance.glasso(pred.glasso$Theta, true)
+    # append measures
+    tpr[i] <- perf$tpr
+    fpr[i] <- perf$fpr
+    error[i] <- perf$error
+  }
+  obj <- list(tpr=tpr, fpr=fpr, error=error)
+  obj$auc <- auc(tpr, fpr)
+  return(obj)
+}
+
+## Find optimal lambda and compare statistics
+## grid = grid of lambda values to be searched
+## k = number of folds
+## crit = cv, aic, bic
+optimal.glasso <- function(X, true, grid, k=10){
+  # k-fold cross-validation
+  fit.loglik <- CVglasso(X=X, lam=grid, K=k, crit.cv="loglik", cores=8, trace="none")
+  errors <- fit.loglik$AVG.error
+  while (TRUE){
+    min.error <- min(errors)
+    grid.cv <- grid
+    lambda.min.cv <- grid.cv[which.min(errors)]
+    best.cv <- predict.glasso(X, lambda.min.cv)
+    # If the predicted edge set is empty, try again with next best value of lambda
+    if (sum(best.cv$E)!=0) break
+    errors <- errors[-which.min(errors)]
+    grid.cv <- grid.cv[-which.min(errors)]
+  }
+  best.cv.perf <- performance.glasso(best.cv$Theta, true)
+  
+  # AIC
+  fit.aic <- CVglasso(X=X, lam=grid, K=1, crit.cv="AIC", trace="none")
+  aics <- fit.aic$AVG.error
+  while (TRUE){
+    min.aic <- min(aics)
+    grid.aic <- grid
+    lambda.min.aic <- grid.aic[which.min(aics)]
+    best.aic <- predict.glasso(X, lambda.min.aic)
+    # If the predicted edge set is empty, try again with next best value of lambda
+    if (sum(best.aic$E)!=0) break
+    aics <- aics[-which.min(aics)]
+    grid.aic <- grid.aic[-which.min(aics)]
+  }
+  best.aic.perf <- performance.glasso(best.aic$Theta, true)
+  
+  # BIC
+  fit.bic <- CVglasso(X=X, lam=grid, K=1, crit.cv="BIC", trace="none")
+  bics <- fit.bic$AVG.error
+  while (TRUE){
+    min.bic <- min(bics)
+    grid.bic <- grid
+    lambda.min.bic <- grid[which.min(bics)]
+    best.bic <- predict.glasso(X, lambda.min.bic)
+    # If the predicted edge set is empty, try again with next best value of lambda
+    if (sum(best.bic$E)!=0) break
+    bics <- bics[-which.min(bics)]
+    grid.bic <- grid.bic[-which.min(bics)]
+  }
+  best.bic.perf <- performance.glasso(best.bic$Theta, true)
+  
+  obj <- list()
+  obj$lambda <- list(cv=lambda.min.cv, aic=lambda.min.aic, bic=lambda.min.bic)
+  obj$score <- list(cv=min.error, aic=min.aic, bic=min.bic)
+  obj$tpr <- list(cv=best.cv.perf$tpr, aic=best.aic.perf$tpr, bic=best.bic.perf$tpr)
+  obj$fpr <- list(cv=best.cv.perf$fpr, aic=best.aic.perf$fpr, bic=best.bic.perf$fpr)
+  obj$error <- list(cv=best.cv.perf$error, aic=best.aic.perf$error, bic=best.bic.perf$error)
+  return(obj)
+}
+
+###############################################################################
+
+# Calculate AUC for different combinations of p and n
+sim_fix <- function(ps, ns, probs, grid, ...){
+  auc_n1_lst <- c()
+  auc_n2_lst <- c()
+  auc_g_lst <- c()
+  for (prob in probs){
+    for (p in ps){
+      p <- round(p)
+      for (n in ns){
+        n <- round(n)
+        # Ensure true edge set is not empty
+        while (TRUE){ 
+          data <- generate(p, n, prob) 
+          if (sum(data$E_true)!=0) break
+        } 
+        perf.n <- performance.nodewise.grid(data$X, data$E_true, grid)
+        perf.g <- performance.glasso.grid(data$X, data$Theta, grid)
+        auc_n1_lst <- append(auc_n1_lst, perf.n$auc_1)
+        auc_n2_lst <- append(auc_n2_lst, perf.n$auc_2)
+        auc_g_lst <- append(auc_g_lst, perf.g$auc)
+        cat("prob=",prob,"n=",n,"p=",p,"\n")
+      }
+    }
+  }
+  obj <- list()
+  obj$n1 <- auc_n1_lst
+  obj$n2 <- auc_n2_lst
+  obj$g <- auc_g_lst
+  return(obj)
+}
+
+###############################################################################
+
+# Repeat with given lambda
+repetition <- function(p, n, prob, grid, t){
+  lam_n_cv <- lam_n_aic <- lam_n_bic <- lam_g_cv <- lam_g_aic <- lam_g_bic <- c()
+  scr_n_cv <- scr_n_aic <- scr_n_bic <- scr_g_cv <- scr_g_aic <- scr_g_bic <- c()
+  tpr_n1_cv <- tpr_n1_aic <- tpr_n1_bic <- c()
+  tpr_n2_cv <- tpr_n2_aic <- tpr_n2_bic <- c()
+  tpr_g_cv <- tpr_g_aic <- tpr_g_bic <- c()
+  fpr_n1_cv <- fpr_n1_aic <- fpr_n1_bic <- c()
+  fpr_n2_cv <- fpr_n2_aic <- fpr_n2_bic <- c()
+  fpr_g_cv <- fpr_g_aic <- fpr_g_bic <- c()
+  err_n1_cv <- err_n1_aic <- err_n1_bic <- c()
+  err_n2_cv <- err_n2_aic <- err_n2_bic <- c()
+  err_g_cv <- err_g_aic <- err_g_bic <- c()
+  for (i in 1:t){
+    cat(i, ".")
+    data <- c()
+    # Ensure true edge set is not empty
+    while (TRUE){ 
+      data <- generate(p, n, prob) 
+      if (sum(data$E_true)!=0) break
+    }
+
+    out_n <- optimal.nodewise(data$X, data$E_true, grid, k=10)
+    out_g <- optimal.glasso(data$X, data$Theta, grid, k=10)
+
+    lam_n_cv[i] <- out_n$lambda$cv
+    lam_n_aic[i] <- out_n$lambda$aic
+    lam_n_bic[i] <- out_n$lambda$bic
+    scr_n_cv[i] <- out_n$score$cv
+    scr_n_aic[i] <- out_n$score$aic
+    scr_n_bic[i] <- out_n$score$bic
+    tpr_n1_cv[i] <- out_n$n1tpr$cv
+    tpr_n1_aic[i] <- out_n$n1tpr$aic
+    tpr_n1_bic[i] <- out_n$n1tpr$bic
+    tpr_n2_cv[i] <- out_n$n2tpr$cv
+    tpr_n2_aic[i] <- out_n$n2tpr$aic
+    tpr_n2_bic[i] <- out_n$n2tpr$bic
+    fpr_n1_cv[i] <- out_n$n1fpr$cv
+    fpr_n1_aic[i] <- out_n$n1fpr$aic
+    fpr_n1_bic[i] <- out_n$n1fpr$bic
+    fpr_n2_cv[i] <- out_n$n2fpr$cv
+    fpr_n2_aic[i] <- out_n$n2fpr$aic
+    fpr_n2_bic[i] <- out_n$n2fpr$bic
+    err_n1_cv[i] <- out_n$n1error$cv
+    err_n1_aic[i] <- out_n$n1error$aic
+    err_n1_bic[i] <- out_n$n1error$bic
+    err_n2_cv[i] <- out_n$n2error$cv
+    err_n2_aic[i] <- out_n$n2error$aic
+    err_n2_bic[i] <- out_n$n2error$bic
+
+    lam_g_cv[i] <- out_g$lambda$cv
+    lam_g_aic[i] <- out_g$lambda$aic
+    lam_g_bic[i] <- out_g$lambda$bic
+    scr_g_cv[i] <- out_g$score$cv
+    scr_g_aic[i] <- out_g$score$aic
+    scr_g_bic[i] <- out_g$score$bic
+    tpr_g_cv[i] <- out_g$tpr$cv
+    tpr_g_aic[i] <- out_g$tpr$aic
+    tpr_g_bic[i] <- out_g$tpr$bic
+    fpr_g_cv[i] <- out_g$fpr$cv
+    fpr_g_aic[i] <- out_g$fpr$aic
+    fpr_g_bic[i] <- out_g$fpr$bic
+    err_g_cv[i] <- out_g$error$cv
+    err_g_aic[i] <- out_g$error$aic
+    err_g_bic[i] <- out_g$error$bic
+  }
+  cv <- list(lam_n = lam_n_cv, lam_g = lam_g_cv, scr_n = scr_n_cv, scr_g = scr_g_cv,
+             tpr_n1 = tpr_n1_cv, tpr_n2 = tpr_n2_cv, tpr_g = tpr_g_cv,
+             fpr_n1 = fpr_n1_cv, fpr_n2 = fpr_n2_cv, fpr_g = fpr_g_cv,
+             err_n1 = err_n1_cv, err_n2 = err_n2_cv, err_g = err_g_cv)
+  aic <- list(lam_n = lam_n_aic, lam_g = lam_g_aic, scr_n = scr_n_aic, scr_g = scr_g_aic,
+             tpr_n1 = tpr_n1_aic, tpr_n2 = tpr_n2_aic, tpr_g = tpr_g_aic,
+             fpr_n1 = fpr_n1_aic, fpr_n2 = fpr_n2_aic, fpr_g = fpr_g_aic,
+             err_n1 = err_n1_aic, err_n2 = err_n2_aic, err_g = err_g_aic)
+  bic <- list(lam_n = lam_n_bic, lam_g = lam_g_bic, scr_n = scr_n_bic, scr_g = scr_g_bic,
+             tpr_n1 = tpr_n1_bic, tpr_n2 = tpr_n2_bic, tpr_g = tpr_g_bic,
+             fpr_n1 = fpr_n1_bic, fpr_n2 = fpr_n2_bic, fpr_g = fpr_g_bic,
+             err_n1 = err_n1_bic, err_n2 = err_n2_bic, err_g = err_g_bic)
+  obj <- list()
+  obj$cv <- cv
+  obj$aic <- aic
+  obj$bic <- bic
+  return(obj)
+}
+```
+
+
+# $n=500, p=50$
+Plot the ROC curve and calculate AUC
+```{r cache=TRUE}
+set.seed(0)
+p <- 50
+n <- 500
+prob <- 0.1
+grid <- 10^seq(-2, 0, length=100)
+
+# Ensure true edge set is not empty
+while (TRUE){ 
+  data <- generate(p, n, prob) 
+  if (sum(data$E_true)!=0) break
+}
+
+perf.nodewise <- performance.nodewise.grid(data$X, data$E_true, grid)
+perf.glasso <- performance.glasso.grid(data$X, data$Theta, grid)
+
+# AUC
+auc_df <- rbind(perf.nodewise$auc_1, perf.nodewise$auc_2, perf.glasso$auc)
+rownames(auc_df) <- c("node1","node2","glasso")
+auc_df
+```
+
+```{r cache=TRUE}
+par(mfrow=c(1,3))
+plot.roc(perf.nodewise$tpr_1, perf.nodewise$fpr_1, col=1, lty=1, lwd=1, main="Node-wise 1")
+plot.roc(perf.nodewise$tpr_2, perf.nodewise$fpr_2, col=1, lty=1, lwd=1, main="Node-wise 2")
+plot.roc(perf.glasso$tpr, perf.glasso$fpr, col=1, lty=1, lwd=1, main="Glasso")
+
+par(mfrow=c(1,1))
+plot.roc.overlay(perf.nodewise$tpr_1, perf.nodewise$fpr_1, perf.nodewise$tpr_2, perf.nodewise$fpr_2, perf.glasso$tpr, perf.glasso$fpr)
+```
+
+# Compare performance for $\lambda=0.08$:
+```{r cache=TRUE}
+set.seed(0)
+p <- 50
+n <- 500
+prob <- 0.1
+
+# Ensure true edge set is not empty
+while (TRUE){ 
+  data <- generate(p, n, prob) 
+  if (sum(data$E_true)!=0) break
+}
+
+#True distribution
+table(data$E_true)
+
+pred.nodewise <- predict.nodewise(data$X, lambda = 0.08)
+pred.glasso <- predict.glasso(data$X, lambda = 0.08)
+nodewise1 <- performance.nodewise(pred.nodewise$E_1, data$E_true)
+nodewise2 <- performance.nodewise(pred.nodewise$E_2, data$E_true)
+glasso <- performance.glasso(pred.glasso$Theta, data$Theta)
+
+# Confusion matrix of Nodewise 1
+table(pred.nodewise$E_1, data$E_true)
+
+# Confusion matrix of Nodewise 2
+table(pred.nodewise$E_2, data$E_true) 
+
+# Confusion matrix of Glasso
+table(pred.glasso$E, data$E_true) 
+
+# Compare statistics
+metrics <- rbind(nodewise1, nodewise2, glasso)
+metrics
+```
+
+
+# Find optimal $\lambda$ using error rate (repeating 100 times):
+
+(WARNING: The following code block can take a long time to run)
+
+```{r cache=TRUE}
+set.seed(0)
+p <- 50
+n <- 500
+prob <- 0.1
+grid <- 10^seq(-1, 1, length=100)
+Error <- Error_1 <- Error_2 <- c()
+
+for (t in 1:100){
+  cat(t, ". ")
+  # Ensure true edge set is not empty
+  while (TRUE){ 
+    data <- generate(p, n, prob) 
+    if (sum(data$E_true)!=0) break
+  }
+  
+  # Node-wise
+  perf.nodewise <- performance.nodewise.grid(data$X, data$E_true, grid)
+  Error_1 <- rbind(Error_1, perf.nodewise$error_1)
+  Error_2 <- rbind(Error_2, perf.nodewise$error_2)
+    
+  # Glasso
+  perf.glasso <- performance.glasso.grid(data$X, data$Theta, grid)
+  Error <- rbind(Error, perf.glasso$error)
+}
+```
+
+```{r cache=TRUE}
+ylab <- "mean misclassification rate"
+xlab <- "log(lambda)"
+ylim <- c(0.039,0.05)
+xlim <- c(-2.4,-1.9)
+par(mfrow=c(1,3), xpd=FALSE)
+res1 <- plot.error(Error_1, grid, main="Node-wise 1", xlim=xlim, ylim=ylim, xlab=xlab, ylab=ylab)
+res2 <- plot.error(Error_2, grid, main="Node-wise 2", xlim=xlim, ylim=ylim, xlab=xlab, ylab=ylab)
+res <- plot.error(Error, grid, main="Glasso", xlim=xlim, ylim=ylim, xlab=xlab, ylab=ylab)
+```
+
+```{r cache=TRUE}
+# Optimal lambdas
+res1$lambda.1se # Node-wise 1
+res2$lambda.1se # Node-wise 2
+res$lambda.1se  # Glasso
+```
+
+```{r cache=TRUE}
+# Optimise using optimal lambdas from above
+pred.nodewise.1 <- predict.nodewise(data$X, lambda=res1$lambda.1se)
+pred.nodewise.2 <- predict.nodewise(data$X, lambda=res2$lambda.1se)
+pred.glasso <- predict.glasso(data$X, lambda=res$lambda.1se)
+
+# Evaluate performance
+nodewise1 <- performance.nodewise(pred.nodewise.1$E_1, data$E_true)
+nodewise2 <- performance.nodewise(pred.nodewise.2$E_2, data$E_true)
+glasso <- performance.glasso(pred.glasso$Theta, data$Theta)
+rbind(nodewise1, nodewise2, glasso)
+```
+
+# Repeat 100 times with $n=500, p=50$ to calculate AUC and error rate
+
+(WARNING: The following code block can take a long time to run)
+
+```{r cache=TRUE}
+set.seed(0)
+p <- 50
+n <- 500
+prob <- 0.1
+grid <- 10^seq(-1, 1, length=100)
+
+aucs <- auc_1 <- auc_2 <- c()
+Error_rep <- Error_rep_1 <- Error_rep_2 <- c()
+t <- 1
+
+while (t<=100){
+  cat(t, ". ")
+  # Ensure true edge set is not empty
+  while (TRUE){ 
+    data <- generate(p, n, prob) 
+    if (sum(data$E_true)!=0) break
+  }
+  # Node-wise
+  perf.nodewise <- performance.nodewise.grid(data$X, data$E_true, grid)
+  auc_1[t] <- perf.nodewise$auc_1
+  auc_2[t] <- perf.nodewise$auc_2
+  Error_rep_1 <- rbind(Error_rep_1, perf.nodewise$error_1)
+  Error_rep_2 <- rbind(Error_rep_2, perf.nodewise$error_2)
+  
+  # Glasso
+  perf.glasso <- performance.glasso.grid(data$X, data$Theta, grid)
+  aucs[t] <- perf.glasso$auc
+  Error_rep <- rbind(Error_rep, perf.glasso$error)
+  
+  t <- t+1
+}
+```
+
+```{r cache=TRUE}
+min_error_1 <- apply(Error_rep_1, 1, min)
+min_error_2 <- apply(Error_rep_2, 1, min)
+min_error <- apply(Error_rep, 1, min)
+
+# boxplot
+par(mfrow=c(1,2))
+names <- c("node1","node2","glasso")
+ylim=NULL
+boxplot(auc_1, auc_2, aucs, main="AUC", names=names)
+boxplot(min_error_1, min_error_2, min_error, main="Minimum \n Misclassification Rate", names=names)
+```
+
+# Find optimal $\lambda$ $n=500, p=50$ with CV, AIC and BIC
+
+- If the estimated edge set using the optimal lambda as determined by CV/AIC/BIC is an empty set, use the next best value of lambda instead. Repeat until a non-empty edge set is predicted. This may be at the boundary of the grid of lambda values to be searched.
+
+```{r cache=TRUE, message=FALSE, warning=FALSE}
+set.seed(0)
+p <- 50
+n <- 500
+prob <- 0.1
+
+# Ensure true edge set is not empty
+while (TRUE){ 
+  data <- generate(p, n, prob) 
+  if (sum(data$E_true)!=0) break
+}
+grid <- 10^seq(-1, 1, length=100)
+k <- 10
+
+optimal_n <- optimal.nodewise(data$X, data$E_true, grid, k)
+optimal_g <- optimal.glasso(data$X, data$Theta, grid, k)
+
+# Nodewise
+do.call(rbind, optimal_n)
+
+# Glasso
+do.call(rbind, optimal_g)
+```
+
+## Repeating 100 times with $n=500, p=50$:
+
+- If the estimated edge set using the optimal lambda as determined by CV/AIC/BIC is an empty set, use the next best value of lambda instead. Repeat until a non-empty edge set is predicted. This may be at the boundary of the grid of lambda values to be searched.
+
+(WARNING: The following code block can take a long time to run)
+
+```{r cache=TRUE}
+set.seed(0)
+p <- 50
+n <- 500
+prob <- 0.1
+grid <- 10^seq(-1, 1, length=100)
+
+out <- repetition(p, n, prob, grid, 100)
+```
+
+```{r cache=TRUE}
+name2 <- c("node1","node2","glasso")
+name1 <- c("node","glasso")
+
+par(mfrow=c(1,3), oma=c(0,0,3,0))
+boxplot(out$cv$lam_n, out$cv$lam_g, main="CV", names=name1)
+boxplot(out$aic$lam_n, out$aic$lam_g, main="AIC", names=name1)
+boxplot(out$bic$lam_n, out$bic$lam_n, main="BIC", names=name1)
+title("Lambda", outer=TRUE, cex=2)
+
+par(mfrow=c(1,3), oma=c(0,0,3,0))
+boxplot(out$cv$tpr_n1, out$cv$tpr_n2, out$cv$tpr_g, main="CV", names=name2)
+boxplot(out$aic$tpr_n1, out$aic$tpr_n2, out$aic$tpr_g, main="AIC", names=name2)
+boxplot(out$bic$tpr_n1, out$bic$tpr_n2, out$bic$tpr_g, main="BIC", names=name2)
+title("TPR", outer=TRUE, cex=2)
+
+par(mfrow=c(1,3), oma=c(0,0,3,0))
+boxplot(out$cv$fpr_n1, out$cv$fpr_n2, out$cv$fpr_g, main="CV", names=name2)
+boxplot(out$aic$fpr_n1, out$aic$fpr_n2, out$aic$fpr_g, main="AIC", names=name2)
+boxplot(out$bic$fpr_n1, out$bic$fpr_n2, out$bic$fpr_g, main="BIC", names=name2)
+title("FPR", outer=TRUE, cex=2)
+
+par(mfrow=c(1,3), oma=c(0,0,3,0))
+boxplot(out$cv$err_n1, out$cv$err_n2, out$cv$err_g, main="CV", names=name2)
+boxplot(out$aic$err_n1, out$aic$err_n2, out$aic$err_g, main="AIC", names=name2)
+boxplot(out$bic$err_n1, out$bic$err_n2, out$bic$err_g, main="BIC", names=name2)
+title("Error rate", outer=TRUE, cex=2)
+```
+
+##########################################################################################################
+
+# $n=2000, p=50$
+Plot the ROC curve and calculate AUC
+```{r cache=TRUE}
+set.seed(0)
+p <- 50
+n <- 2000
+prob <- 0.1
+grid <- 10^seq(-2, 1, length=100)
+
+# Ensure true edge set is not empty
+while (TRUE){ 
+  data <- generate(p, n, prob) 
+  if (sum(data$E_true)!=0) break
+}
+
+perf.nodewise <- performance.nodewise.grid(data$X, data$E_true, grid)
+perf.glasso <- performance.glasso.grid(data$X, data$Theta, grid)
+
+# AUC
+auc_df <- rbind(perf.nodewise$auc_1, perf.nodewise$auc_2, perf.glasso$auc)
+rownames(auc_df) <- c("node1","node2","glasso")
+auc_df
+```
+
+```{r cache=TRUE}
+par(mfrow=c(1,3))
+plot.roc(perf.nodewise$tpr_1, perf.nodewise$fpr_1, col=1, lty=1, lwd=1, main="Node-wise 1")
+plot.roc(perf.nodewise$tpr_2, perf.nodewise$fpr_2, col=1, lty=1, lwd=1, main="Node-wise 2")
+plot.roc(perf.glasso$tpr, perf.glasso$fpr, col=1, lty=1, lwd=1, main="Glasso")
+
+par(mfrow=c(1,1))
+plot.roc.overlay(perf.nodewise$tpr_1, perf.nodewise$fpr_1, perf.nodewise$tpr_2, perf.nodewise$fpr_2, perf.glasso$tpr, perf.glasso$fpr)
+```
+
+# Find optimal $\lambda$ using error rate (repeating 100 times):
+
+(WARNING: The following code block can take a long time to run)
+
+```{r cache=TRUE}
+set.seed(0)
+p <- 50
+n <- 2000
+prob <- 0.1
+grid <- 10^seq(-2, 1, length=100)
+Error <- Error_1 <- Error_2 <- c()
+
+for (t in 1:100){
+  cat(t, ". ")
+  
+  # Ensure true edge set is not empty
+  while (TRUE){ 
+    data <- generate(p, n, prob) 
+    if (sum(data$E_true)!=0) break
+  }
+  
+  # Node-wise
+  perf.nodewise <- performance.nodewise.grid(data$X, data$E_true, grid)
+  Error_1 <- rbind(Error_1, perf.nodewise$error_1)
+  Error_2 <- rbind(Error_2, perf.nodewise$error_2)
+    
+  # Glasso
+  perf.glasso <- performance.glasso.grid(data$X, data$Theta, grid)
+  Error <- rbind(Error, perf.glasso$error)
+}
+```
+
+```{r cache=TRUE}
+ylab <- "mean misclassification rate"
+xlab <- "log(lambda)"
+ylim <- c(0.001, 0.008)
+xlim <- c(-2.7,-2.2)
+par(mfrow=c(1,3), xpd=FALSE)
+res1 <- plot.error(Error_1, grid, main="Node-wise 1", xlim=xlim, ylim=ylim, xlab=xlab, ylab=ylab)
+res2 <- plot.error(Error_2, grid, main="Node-wise 2", xlim=xlim, ylim=ylim, xlab=xlab, ylab=ylab)
+res <- plot.error(Error, grid, main="Glasso", xlim=xlim, ylim=ylim, xlab=xlab, ylab=ylab)
+```
+
+```{r cache=TRUE}
+# Optimal lambdas
+res1$lambda.1se # Node-wise 1
+res2$lambda.1se # Node-wise 2
+res$lambda.1se  # Glasso
+```
+
+```{r cache=TRUE}
+# Optimise using optimal lambdas
+pred.nodewise.1 <- predict.nodewise(data$X, lambda=res1$lambda.1se)
+pred.nodewise.2 <- predict.nodewise(data$X, lambda=res2$lambda.1se)
+pred.glasso <- predict.glasso(data$X, lambda=res$lambda.1se)
+
+# Evaluate performance
+nodewise1 <- performance.nodewise(pred.nodewise.1$E_1, data$E_true)
+nodewise2 <- performance.nodewise(pred.nodewise.2$E_2, data$E_true)
+glasso <- performance.glasso(pred.glasso$Theta, data$Theta)
+rbind(nodewise1, nodewise2, glasso)
+```
+
+# Repeat 100 times with $n=2000, p=50$ to calculate AUC and error rate
+
+(WARNING: The following code block can take a long time to run)
+
+```{r cache=TRUE}
+set.seed(0)
+p <- 50
+n <- 2000
+prob <- 0.1
+grid <- 10^seq(-2, 1, length=100)
+
+aucs <- auc_1 <- auc_2 <- c()
+Error_rep <- Error_rep_1 <- Error_rep_2 <- c()
+t <- 1
+
+while (t<=100){
+  cat(t, ". ")
+  # Ensure true edge set is not empty
+  while (TRUE){ 
+    data <- generate(p, n, prob) 
+    if (sum(data$E_true)!=0) break
+  }
+  # Node-wise
+  perf.nodewise <- performance.nodewise.grid(data$X, data$E_true, grid)
+  auc_1[t] <- perf.nodewise$auc_1
+  auc_2[t] <- perf.nodewise$auc_2
+  Error_rep_1 <- rbind(Error_rep_1, perf.nodewise$error_1)
+  Error_rep_2 <- rbind(Error_rep_2, perf.nodewise$error_2)
+  
+  # Glasso
+  perf.glasso <- performance.glasso.grid(data$X, data$Theta, grid)
+  aucs[t] <- perf.glasso$auc
+  Error_rep <- rbind(Error_rep, perf.glasso$error)
+  
+  t <- t+1
+}
+```
+
+```{r cache=TRUE}
+min_error_1 <- apply(Error_rep_1, 1, min)
+min_error_2 <- apply(Error_rep_2, 1, min)
+min_error <- apply(Error_rep, 1, min)
+
+# boxplot
+par(mfrow=c(1,2))
+names <- c("node1","node2","glasso")
+ylim=NULL
+boxplot(auc_1, auc_2, aucs, main="AUC", names=names)
+boxplot(min_error_1, min_error_2, min_error, main="Minimum \n Misclassification Rate", names=names)
+```
+
+# Find optimal $\lambda$ $n=2000, p=50$ with CV, AIC and BIC
+
+- If the estimated edge set using the optimal lambda as determined by CV/AIC/BIC is an empty set, use the next best value of lambda instead. Repeat until a non-empty edge set is predicted. This may be at the boundary of the grid of lambda values to be searched.
+
+```{r cache=TRUE, message=FALSE}
+set.seed(1)
+p <- 50
+n <- 2000
+prob <- 0.1
+
+# Ensure true edge set is not empty
+while (TRUE){ 
+  data <- generate(p, n, prob) 
+  if (sum(data$E_true)!=0) break
+}
+grid <- 10^seq(-2, 1, length=100)
+k <- 10
+
+optimal_n <- optimal.nodewise(data$X, data$E_true, grid, k)
+optimal_g <- optimal.glasso(data$X, data$Theta, grid, k)
+
+# Nodewise
+do.call(rbind, optimal_n)
+
+# Glasso
+do.call(rbind, optimal_g)
+```
+
+## Repeating 100 times with $n=2000, p=50$:
+
+- If the estimated edge set using the optimal lambda as determined by CV/AIC/BIC is an empty set, use the next best value of lambda instead. Repeat until a non-empty edge set is predicted. This may be at the boundary of the grid of lambda values to be searched.
+
+(WARNING: The following code block can take a long time to run)
+
+```{r cache=TRUE, message=FALSE, warning=FALSE}
+set.seed(0)
+p <- 50
+n <- 2000
+prob <- 0.1
+grid <- 10^seq(-1, 1, length=100)
+
+out <- repetition(p, n, prob, grid, 100)
+```
+
+```{r cache=TRUE}
+name2 <- c("node1","node2","glasso")
+name1 <- c("node","glasso")
+
+par(mfrow=c(1,3), oma=c(0,0,3,0))
+boxplot(out$cv$lam_n, out$cv$lam_g, main="CV", names=name1)
+boxplot(out$aic$lam_n, out$aic$lam_g, main="AIC", names=name1)
+boxplot(out$bic$lam_n, out$bic$lam_n, main="BIC", names=name1)
+title("Lambda", outer=TRUE, cex=2)
+
+par(mfrow=c(1,3), oma=c(0,0,3,0))
+boxplot(out$cv$tpr_n1, out$cv$tpr_n2, out$cv$tpr_g, main="CV", names=name2)
+boxplot(out$aic$tpr_n1, out$aic$tpr_n2, out$aic$tpr_g, main="AIC", names=name2)
+boxplot(out$bic$tpr_n1, out$bic$tpr_n2, out$bic$tpr_g, main="BIC", names=name2)
+title("TPR", outer=TRUE, cex=2)
+
+par(mfrow=c(1,3), oma=c(0,0,3,0))
+boxplot(out$cv$fpr_n1, out$cv$fpr_n2, out$cv$fpr_g, main="CV", names=name2)
+boxplot(out$aic$fpr_n1, out$aic$fpr_n2, out$aic$fpr_g, main="AIC", names=name2)
+boxplot(out$bic$fpr_n1, out$bic$fpr_n2, out$bic$fpr_g, main="BIC", names=name2)
+title("FPR", outer=TRUE, cex=2)
+
+par(mfrow=c(1,3), oma=c(0,0,3,0))
+boxplot(out$cv$err_n1, out$cv$err_n2, out$cv$err_g, main="CV", names=name2)
+boxplot(out$aic$err_n1, out$aic$err_n2, out$aic$err_g, main="AIC", names=name2)
+boxplot(out$bic$err_n1, out$bic$err_n2, out$bic$err_g, main="BIC", names=name2)
+title("Error rate", outer=TRUE, cex=2)
+```
+
+##########################################################################################################
+
+# Calculate AUC with fixed $p$ and different values of $n$
+
+(WARNING: The following code block can take a long time to run)
+
+```{r cache=TRUE}
+set.seed(0)
+prob <- 0.1
+grid <- 10^seq(-2, 1, length=100)
+ns <- c(seq(10,90,10), seq(100,1000,100)) 
+
+# p=20
+auc_20 <- sim_fix(ps=20, ns, prob, grid)
+par(mfrow=c(1,3))
+plot(ns, auc_20$n1, "b", col=1, lty=1, xlab = "n", ylab = "AUC", main="Nodewise 1, p=20, prob=0.1")
+plot(ns, auc_20$n2, "b", col=1, lty=1, xlab = "n", ylab = "AUC", main="Nodewise 2, p=20, prob=0.1")
+plot(ns, auc_20$g, "b", col=1, lty=1, xlab = "n", ylab = "AUC", main="Glasso, p=20, prob=0.1")
+
+# p=50
+auc_50 <- sim_fix(ps=50, ns, prob, grid)
+par(mfrow=c(1,3))
+plot(ns, auc_50$n1, "b", col=1, lty=1, xlab = "n", ylab = "AUC", main="Nodewise 1, p=50, prob=0.1")
+plot(ns, auc_50$n2, "b", col=1, lty=1, xlab = "n", ylab = "AUC", main="Nodewise 2, p=50, prob=0.1")
+plot(ns, auc_50$g, "b", col=1, lty=1, xlab = "n", ylab = "AUC", main="Glasso, p=50, prob=0.1")
+
+# p=100
+auc_100 <- sim_fix(ps=100, ns, prob, grid)
+par(mfrow=c(1,3))
+plot(ns, auc_100$n1, "b", col=1, lty=1, xlab = "n", ylab = "AUC", main="Nodewise 1, p=100, prob=0.1")
+plot(ns, auc_100$n2, "b", col=1, lty=1, xlab = "n", ylab = "AUC", main="Nodewise 2, p=100, prob=0.1")
+plot(ns, auc_100$g, "b", col=1, lty=1, xlab = "n", ylab = "AUC", main="Glasso, p=100, prob=0.1")
+```
+
+
+# Calculate AUC with $n=500$ and $p=50$ for different sparsity patterns
+
+(WARNING: The following code block can take a long time to run)
+
+```{r cache=TRUE}
+set.seed(0)
+probs <- seq(0.05, 0.95, by=0.05)
+grid <- 10^seq(-2, 1, length=100) 
+
+auc_p <- sim_fix(ps=50, ns=500, probs, grid)
+par(mfrow=c(1,3))
+plot(probs, auc_p$n1, "b", col=1, lty=1, xlab = "prob", ylab = "AUC", main="Nodewise 1, p=50, n=500")
+plot(probs, auc_p$n2, "b", col=1, lty=1, xlab = "prob", ylab = "AUC", main="Nodewise 2, p=50, n=500")
+plot(probs, auc_p$g, "b", col=1, lty=1, xlab = "prob", ylab = "AUC", main="Glasso, p=50, n=500")
+```
+
+
